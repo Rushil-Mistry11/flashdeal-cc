@@ -62,15 +62,11 @@ jobs:
             (cd "$svc" && npm install --package-lock-only --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null \
               && npm audit --omit=dev --audit-level=critical)
           done
-      - name: Scan repository (misconfigurations, secrets, HIGH/CRITICAL CVEs) with Trivy
-        uses: aquasecurity/trivy-action@0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,secret,misconfig
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: '0'          # report only; change to '1' to make HIGH findings block the build
+      - name: Scan repository with Trivy (secrets, misconfigurations, HIGH/CRITICAL CVEs)
+        continue-on-error: true      # report only; remove this line to make findings block the build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src aquasec/trivy:latest fs \
+            --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 .
       - name: Shell script lint
         run: shellcheck -S error aws/*.sh scripts/*.sh
 
