@@ -63,7 +63,7 @@ jobs:
               && npm audit --omit=dev --audit-level=critical)
           done
       - name: Scan repository (misconfigurations, secrets, HIGH/CRITICAL CVEs) with Trivy
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@0
         with:
           scan-type: fs
           scan-ref: .
