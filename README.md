@@ -187,3 +187,5 @@ See the table at the end of `docs/aws-deploy.md`. Quick ones:
 - **Shop is empty or shows an error**: check `docker compose logs migrate catalog-service`. The `migrate` container must have finished successfully.
 - **Everything looks sold out**: click *Reset sale* in the Control room.
 - **Port already in use on the laptop** (3000, 8080, 27018): change the left side of that port mapping in `docker-compose.local.yml`.
+ 
+ 
