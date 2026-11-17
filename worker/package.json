@@ -1,0 +1,11 @@
+{
+  "name": "flashdeal-worker",
+  "version": "1.0.0",
+  "main": "src/worker.js",
+  "scripts": { "start": "node src/worker.js" },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "ioredis": "^5.4.1",
+    "mongoose": "^8.5.1"
+  }
+}

@@ -1,0 +1,127 @@
+# FlashDeal on AWS (EC2). Use this file on the EC2 instance:   docker compose up -d --build
+# For testing on your laptop use docker-compose.local.yml instead.
+#
+#  - Queue:    AWS SQS (queue "flashdeal-claims" + dead-letter queue). Created by aws/setup-sqs.sh.
+#  - Storage:  MongoDB data lives on the extra EBS volume mounted at /mnt/mongo-data (aws/mount-ebs.sh).
+#  - Logs:     gateway, worker, catalog and nginx logs stream to CloudWatch Logs (awslogs driver).
+#  - Network:  only nginx (port 80) is published. Gateway, Redis and MongoDB are NOT reachable from outside the host.
+#  - IAM:      no access keys anywhere: the AWS SDK and the Docker daemon use the EC2 instance profile (LabInstanceProfile).
+
+x-cloudwatch: &cloudwatch
+  driver: awslogs
+  options:
+    awslogs-region: ${AWS_REGION:-us-east-1}
+    awslogs-group: ${CW_LOG_GROUP:-/aws/ec2/flashdeal-logs}
+    awslogs-create-group: "true"
+    tag: "{{.Name}}"          # log stream name = container name
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - /mnt/mongo-data/db:/data/db   # EBS volume (see aws/mount-ebs.sh). Survives container and instance restarts.
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+  # One-shot job: creates collections, validators, indexes and seeds the catalogue. Exits when done.
+  migrate:
+    build: ./db
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB=flashdeal
+    depends_on:
+      mongo: { condition: service_healthy }
+    restart: "no"
+
+  catalog-service:
+    build: ./catalog-service
+    restart: unless-stopped
+    logging: *cloudwatch
+    environment:
+      - SERVICE_NAME=catalog-service
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB=flashdeal
+    depends_on:
+      mongo: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api-gateway:
+    build: ./api-gateway
+    restart: unless-stopped
+    logging: *cloudwatch
+    # no "ports:" on purpose: reachable only through nginx (client) on the Docker network
+    environment:
+      - SERVICE_NAME=api-gateway
+      - REDIS_URL=redis://redis:6379
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB=flashdeal
+      - CATALOG_SERVICE_URL=http://catalog-service:4000
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - SQS_QUEUE_NAME=${SQS_QUEUE_NAME:-flashdeal-claims}
+      - RATE_LIMIT_CAPACITY=${RATE_LIMIT_CAPACITY:-10}              # bucket size (burst)
+      - RATE_LIMIT_REFILL_PER_SEC=${RATE_LIMIT_REFILL_PER_SEC:-5}   # sustained requests/sec per client IP
+      - CACHE_TTL_SEC=3
+    depends_on:
+      redis: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      catalog-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    logging: *cloudwatch
+    environment:
+      - SERVICE_NAME=worker
+      - REDIS_URL=redis://redis:6379
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB=flashdeal
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - SQS_QUEUE_NAME=${SQS_QUEUE_NAME:-flashdeal-claims}
+      - WORKER_PREFETCH=5                                   # concurrent claims per worker
+      - PROCESSING_MS_MIN=${PROCESSING_MS_MIN:-150}         # simulated payment / validation latency
+      - PROCESSING_MS_MAX=${PROCESSING_MS_MAX:-400}
+      - FAIL_RATE=${FAIL_RATE:-0}                           # e.g. 0.3 = 30% simulated failures (shows retry + SQS dead-letter queue)
+    depends_on:
+      redis: { condition: service_healthy }
+      mongo: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:                                            # worker is healthy while its SQS polling loops are alive
+      test: ["CMD-SHELL", "test $$(( $$(date +%s) - $$(stat -c %Y /tmp/heartbeat) )) -lt 60"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  client:
+    build: ./client
+    restart: unless-stopped
+    logging: *cloudwatch
+    ports:
+      - "80:80"        # the only public entry point (Security Group allows port 80)
+    depends_on:
+      - api-gateway

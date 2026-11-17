@@ -1,0 +1,145 @@
+# FlashDeal CI/CD pipeline (GitHub Actions) -> AWS EC2
+#
+#   pull request  : static checks + security scan + build           (nothing is deployed)
+#   push to main  : static checks + security scan + build + DEPLOY  (after approval of the "production" environment, if you enabled it)
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   EC2_HOST      Elastic IP of the instance
+#   EC2_USER      ubuntu
+#   EC2_SSH_KEY   full contents of labsuser.pem
+# Design and setup: docs/cicd-design.md
+
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel a deploy that is already running
+
+jobs:
+  # ---------------------------------------------------------------- 1. Continuous integration
+  checks:
+    name: Static checks (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api-gateway, worker, catalog-service]
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install dependencies (proves package.json resolves)
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: Syntax check every source file
+        run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Dependency audit (fails the build on CRITICAL vulnerabilities)
+        run: |
+          for svc in api-gateway worker catalog-service db client; do
+            echo "== $svc"
+            (cd "$svc" && npm install --package-lock-only --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null \
+              && npm audit --omit=dev --audit-level=critical)
+          done
+      - name: Scan repository (misconfigurations, secrets, HIGH/CRITICAL CVEs) with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'          # report only; change to '1' to make HIGH findings block the build
+      - name: Shell script lint
+        run: shellcheck -S error aws/*.sh scripts/*.sh
+
+  build:
+    name: Build and validate
+    needs: [checks, security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate both compose files
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+          AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_SESSION_TOKEN=x docker compose -f docker-compose.local.yml config -q
+      - name: Build all Docker images
+        run: |
+          AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_SESSION_TOKEN=x docker compose -f docker-compose.local.yml build
+
+  # ---------------------------------------------------------------- 2. Continuous deployment
+  deploy:
+    name: Deploy to AWS EC2
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production        # add "required reviewers" to this environment for a manual approval gate
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -T 15 -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          printf 'Host target\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_deploy\n  ServerAliveInterval 15\n  ConnectTimeout 20\n' "$EC2_HOST" "$EC2_USER" > ~/.ssh/config
+
+      - name: Save the running release (for rollback)
+        id: backup
+        run: |
+          ssh target 'mkdir -p ~/releases && cd ~/flashdeal-cc && tar czf ~/releases/$(date +%Y%m%d-%H%M%S).tgz --exclude=.env . && ls -1t ~/releases | tail -n +4 | xargs -r -I{} rm -f ~/releases/{}'
+
+      - name: Upload the new release
+        run: |
+          rsync -az --delete \
+            --exclude '.git' --exclude '.github' --exclude '.env' --exclude 'node_modules' --exclude 'load-test/results' \
+            ./ target:~/flashdeal-cc/
+
+      - name: Rebuild and restart the stack
+        run: ssh target 'cd ~/flashdeal-cc && docker compose up -d --build --remove-orphans && docker image prune -f'
+
+      - name: Wait until the application is healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -m 5 "http://$EC2_HOST/api/health" | jq -e '.status == "UP"' >/dev/null 2>&1; then
+              echo "healthy after ~$((i*5))s"; exit 0
+            fi
+            sleep 5
+          done
+          echo "application did not become healthy"; exit 1
+
+      - name: Smoke test (claim travels gateway -> SQS -> worker -> MongoDB)
+        run: bash scripts/smoke-test.sh "http://$EC2_HOST"
+
+      - name: Roll back to the previous release
+        if: failure() && steps.backup.outcome == 'success'
+        run: |
+          ssh target 'cd ~/flashdeal-cc && tar xzf "$(ls -1t ~/releases/*.tgz | head -1)" && docker compose up -d --build --remove-orphans'
+          echo "::error::Deployment failed and was rolled back to the previous release"

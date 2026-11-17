@@ -1,0 +1,8 @@
+{
+  "name": "flashdeal-load-test",
+  "version": "1.0.0",
+  "scripts": {
+    "claim": "node loadtest.js --target claim --total 500 --concurrency 50",
+    "deals": "node loadtest.js --target deals --total 500 --concurrency 50"
+  }
+}
